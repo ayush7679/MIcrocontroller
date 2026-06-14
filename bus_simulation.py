@@ -1,313 +1,661 @@
 """
-RFID Bus Fare Management System - Software Bus Simulator
------------------------------------------------------------------
-Controls:
-  SPACE -> Start / Stop the bus
-  N     -> Simulate "Normal" card tap   (pays 100% fare)
-  S     -> Simulate "Special" card tap  (pays 55% fare - student/senior)
-  R     -> Recharge both cards (+100)
-  ESC   -> Quit
+RFID Bus Fare Management System — Kathmandu Ring Road Simulator
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Route: Kalanki → Soalte Dobato → Swayambhu → Banasthali →
+       Balaju → Gongabu → Basundhara → Chakrapath →
+       Dhumbarahi → Sukedhara → Chabahil → Mitrapark →
+       Gaushala → Airport → Tinkune → Koteshwor →
+       Balkumari → Gwarko → Satobato → Mahalaxmisthan →
+       Ekantakuna → Sanepa → Balku → Kalanki
 
-Once your Arduino + RC522 is ready, replace the keyboard simulation
-(see the SERIAL SECTION comments) with real serial reads from Arduino.
+Controls:
+  SPACE  ->  Start / Stop bus
+  N      ->  Tap Normal card  (white card · 100% fare)
+  S      ->  Tap Special card (key tag   ·  55% fare)
+  R      ->  Recharge both cards (+Rs.100)
+  ESC    ->  Quit
+
+Set SERIAL_PORT = "COM3" (or your port) when Arduino is ready.
 """
 
-import pygame
-import time
-import math
-import csv
-import os
-import datetime
+import pygame, time, math, csv, os, datetime, random
 
-# ───────────────────────── CONFIG ─────────────────────────
-WIDTH, HEIGHT = 900, 540
-FPS = 60
-FARE_RATE = 1        # rupees added per second while bus is moving
-ROAD_Y = 330              # y-coordinate of the road surface
-BUS_W, BUS_H = 110, 55
-STOP_POSITIONS = [150 + (i * 230) for i in range(1000)]  # x-positions of bus stops (world space)
-LOG_FILE = "transaction_log.csv"
+# ── CONFIG ────────────────────────────────────────────────────────
+W, H        = 1100, 640
+FPS         = 60
+FARE_RATE   = 0.5          # Rs per second while moving
+ROAD_Y      = 340          # road top edge
+LOG_FILE    = "transaction_log.csv"
+SERIAL_PORT = None         # e.g. "COM3"
 
-CARD_BALANCES = {
-    "NORMAL": 200.0,
-    "SPECIAL": 200.0
+ROUTE = [
+    "Kalanki","Soalte Dobato","Swayambhu","Banasthali Chowk",
+    "Balaju Chowk","Gongabu","Basundhara","Chakrapath",
+    "Dhumbarahi","Sukedhara","Chabahil","Mitrapark",
+    "Gaushala","Airport","Tinkune","Koteshwor",
+    "Balkumari","Gwarko","Satobato","Mahalaxmisthan",
+    "Ekantakuna","Sanepa","Balku","Kalanki"
+]
+
+STOP_SPACING = 420          # pixels between stops in world space
+STOPS = [i * STOP_SPACING for i in range(len(ROUTE))]
+TOTAL_WORLD  = STOPS[-1] + STOP_SPACING
+
+BALANCES = {"NORMAL": 200.0, "SPECIAL": 200.0}
+
+# ── COLOURS ───────────────────────────────────────────────────────
+SKY_TOP    = ( 30,  95, 170)
+SKY_BOT    = (120, 190, 235)
+HILL1      = ( 55, 120,  60)
+HILL2      = ( 70, 150,  75)
+GRASS      = ( 60, 145,  55)
+ROAD_C     = ( 48,  50,  56)
+ROAD_SIDE  = ( 80,  82,  90)
+DASH_C     = (240, 215,  55)
+FOOTPATH   = (180, 165, 140)
+BUILDING_COLS = [
+    (180,140,100),(160,120, 90),(190,160,110),
+    (140,130,120),(200,180,140),(170,145, 95),
+]
+PANEL_BG   = ( 12,  14,  28)
+PANEL_TOP  = ( 20,  24,  45)
+ACCENT     = (255, 200,  45)
+GREEN_C    = ( 45, 215,  95)
+RED_C      = (225,  55,  55)
+GREY_C     = (175, 175, 188)
+WHITE      = (255, 255, 255)
+BUS_RED    = (215,  48,  48)
+BUS_DARK   = (160,  28,  28)
+BUS_GOLD   = (255, 210,  40)
+WIN_C      = (185, 232, 255)
+TYRE_C     = ( 22,  22,  28)
+SIGN_GREEN = ( 20, 120,  60)
+SIGN_BLUE  = ( 30,  80, 160)
+
+# ── PYGAME INIT ───────────────────────────────────────────────────
+pygame.init()
+pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
+screen = pygame.display.set_mode((W, H))
+pygame.display.set_caption("RFID Bus Fare — Kathmandu Ring Road")
+clock  = pygame.time.Clock()
+
+def fnt(sz, bold=False):
+    return pygame.font.SysFont("Segoe UI", sz, bold=bold)
+
+F = {
+    "title" : fnt(19, True),
+    "big"   : fnt(30, True),
+    "med"   : fnt(19, True),
+    "sm"    : fnt(15),
+    "xs"    : fnt(13),
+    "xxs"   : fnt(11),
+    "fare"  : fnt(40, True),
+    "stop"  : fnt(12, True),
 }
 
-# ───────────────────────── INIT ─────────────────────────
-pygame.init()
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("RFID Bus Fare Management System")
-clock = pygame.time.Clock()
+# ── SOUND ─────────────────────────────────────────────────────────
+SND_OK1 = SND_OK2 = SND_FAIL = SND_TAP = SND_ARRIVE = None
+HAS_SND = False
+try:
+    import numpy as np
+    def synth(freq, dur_ms, vol=0.35, shape="sine"):
+        sr = 44100; n = int(sr * dur_ms / 1000)
+        t  = np.linspace(0, dur_ms/1000, n, False)
+        if shape == "sine":  wave = np.sin(2*np.pi*freq*t)
+        elif shape == "sq":  wave = np.sign(np.sin(2*np.pi*freq*t)) * 0.3
+        fade = np.linspace(1, 0, n)**0.4
+        s    = (wave * fade * vol * 32767).astype(np.int16)
+        return pygame.sndarray.make_sound(np.column_stack([s,s]))
+    SND_OK1   = synth(880,  120)
+    SND_OK2   = synth(1100, 120)
+    SND_FAIL  = synth(300,  380)
+    SND_TAP   = synth(660,   70)
+    SND_ARRIVE= synth(523,  200)
+    HAS_SND   = True
+    print("Sound: enabled")
+except Exception as e:
+    print(f"Sound: disabled — pip install numpy --user to enable")
 
-font_title = pygame.font.SysFont("Segoe UI", 22, bold=True)
-font_big   = pygame.font.SysFont("Segoe UI", 30, bold=True)
-font_med   = pygame.font.SysFont("Segoe UI", 20, bold=True)
-font_small = pygame.font.SysFont("Segoe UI", 16)
+def play(snd):
+    if HAS_SND and snd is not None:
+        try: snd.play()
+        except: pass
 
-# Colors
-SKY_TOP    = (90, 160, 220)
-SKY_BOTTOM = (180, 220, 245)
-GROUND     = (96, 168, 90)
-ROAD_COL   = (60, 60, 65)
-LINE_COL   = (245, 220, 90)
-PANEL_BG   = (24, 28, 48)
-ACCENT     = (255, 205, 60)
+# ── STATE ─────────────────────────────────────────────────────────
+world_x         = 0.0
+moving          = False
+fare            = 0.0
+last_tick       = time.time()
+wheel_ang       = 0.0
+bob             = 0.0
+transactions    = []
+pmsg            = ""
+pmsg_ok         = True
+pmsg_timer      = 0
+receipt         = None
+receipt_timer   = 0
+total_collected = 0.0
+cur_stop_idx    = 0
+at_stop         = False
+stop_dwell      = 0        # frames to dwell at stop
+next_stop_dist  = 0.0
 
-# ───────────────────────── STATE ─────────────────────────
-world_x        = 0.0          # how far the "world" has scrolled (bus distance)
-bus_moving     = False
-fare           = 0.0
-last_tick      = time.time()
-payment_msg    = ""
-payment_ok     = True
-msg_timer      = 0
-transactions   = []
-wheel_angle    = 0
-bob_offset     = 0
-near_stop      = False
+# pre-generate buildings for each stop neighbourhood
+random.seed(7)
+buildings = []
+for i, sx in enumerate(STOPS):
+    for side in [1, -1]:          # 1=above road, -1=below (not used, just above)
+        n = random.randint(3, 6)
+        bx = sx - 200
+        for _ in range(n):
+            bw = random.randint(40, 80)
+            bh = random.randint(45, 110)
+            bc = random.choice(BUILDING_COLS)
+            buildings.append({"x": bx, "w": bw, "h": bh, "col": bc,
+                               "win_rows": random.randint(2,5),
+                               "win_cols": random.randint(2,4)})
+            bx += bw + random.randint(4, 14)
 
-# ───────────────────────── HELPERS ─────────────────────────
-def log_transaction(card_type, paid, balance):
-    file_exists = os.path.isfile(LOG_FILE)
-    with open(LOG_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["timestamp", "card_type", "fare_paid", "remaining_balance"])
-        writer.writerow([
-            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            card_type, f"{paid:.2f}", f"{balance:.2f}"
-        ])
+# trees between stops
+trees = []
+for i in range(len(STOPS)-1):
+    base = STOPS[i] + 80
+    end  = STOPS[i+1] - 80
+    for _ in range(random.randint(3,7)):
+        tx = random.randint(int(base), max(int(base)+1, int(end)))
+        trees.append({"x": tx, "h": random.randint(28,50),
+                      "col": random.choice([(40,130,50),(50,145,55),(35,115,45)])})
 
+# people at stops
+pax_groups = []
+for i, sx in enumerate(STOPS[:-1]):
+    for _ in range(random.randint(2, 5)):
+        px = sx + random.randint(-30, 30)
+        pax_groups.append({"x": px, "stop": i,
+                            "col": random.choice([(80,110,200),(200,90,70),(90,160,90),(180,140,60)])})
 
-def process_payment(card_type):
-    """card_type: 'NORMAL' or 'SPECIAL'"""
-    global fare, payment_msg, payment_ok, msg_timer
+# ── HELPERS ──────────────────────────────────────────────────────
+def log_tx(card, paid, bal):
+    new = not os.path.isfile(LOG_FILE)
+    with open(LOG_FILE,"a",newline="") as f:
+        w = csv.writer(f)
+        if new: w.writerow(["timestamp","card","fare","balance"])
+        w.writerow([datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    card, f"{paid:.2f}", f"{bal:.2f}"])
 
-    discount = 0.55 if card_type == "SPECIAL" else 1.0
-    actual_fare = round(fare * discount, 2)
-    label = "Student/Senior (55%)" if card_type == "SPECIAL" else "Normal (100%)"
-
-    if actual_fare <= 0:
-        payment_msg = "No fare accumulated yet - let the bus move!"
-        payment_ok = False
-    elif CARD_BALANCES[card_type] >= actual_fare:
-        CARD_BALANCES[card_type] -= actual_fare
-        transactions.append({"label": label, "fare": actual_fare,
-                              "balance": CARD_BALANCES[card_type]})
-        log_transaction(card_type, actual_fare, CARD_BALANCES[card_type])
-        payment_msg = f"PAID Rs.{actual_fare:.2f} ({label}) | Balance: Rs.{CARD_BALANCES[card_type]:.2f}"
-        payment_ok = True
+def process(card):
+    global fare, pmsg, pmsg_ok, pmsg_timer, receipt, receipt_timer, total_collected
+    disc  = 0.55 if card == "SPECIAL" else 1.0
+    paid  = round(fare * disc, 2)
+    label = "Student/Senior (55%)" if card == "SPECIAL" else "Normal (100%)"
+    if paid <= 0:
+        pmsg = "No fare yet — press SPACE to start the bus!";  pmsg_ok = False
+        pmsg_timer = 180; return
+    if BALANCES[card] >= paid:
+        BALANCES[card]  = round(BALANCES[card] - paid, 2)
+        total_collected = round(total_collected + paid, 2)
+        transactions.append({"label":label,"fare":paid,"bal":BALANCES[card]})
+        log_tx(card, paid, BALANCES[card])
+        pmsg    = f"Paid Rs.{paid:.2f}  —  {label}  |  Balance: Rs.{BALANCES[card]:.2f}"
+        pmsg_ok = True
+        receipt = {"card":card,"label":label,"paid":paid,"bal":BALANCES[card],
+                   "time":datetime.datetime.now().strftime("%H:%M:%S"),
+                   "from": ROUTE[max(0,cur_stop_idx-1)],
+                   "to":   ROUTE[min(len(ROUTE)-1,cur_stop_idx)]}
+        receipt_timer = 300
         fare = 0.0
+        play(SND_OK1)
+        pygame.time.set_timer(pygame.USEREVENT+1, 180, 1)
     else:
-        payment_msg = f"LOW BALANCE on {label} card! Please recharge."
-        payment_ok = False
+        pmsg    = f"LOW BALANCE — {label}  |  Only Rs.{BALANCES[card]:.2f} left"
+        pmsg_ok = False
+        play(SND_FAIL)
+    pmsg_timer = 220
 
-    msg_timer = 180  # show for 3 seconds
+def get_stop_idx(wx):
+    bus_pos = wx + W//2
+    for i in range(len(STOPS)-1, -1, -1):
+        if bus_pos >= STOPS[i]:
+            return i
+    return 0
 
+# ── DRAW UTILS ────────────────────────────────────────────────────
+def dr(col, x,y,w,h, r=0):
+    pygame.draw.rect(screen, col, (int(x),int(y),int(w),int(h)), border_radius=r)
 
-# ───────────────────────── DRAW FUNCTIONS ─────────────────────────
-def draw_background():
-    # Sky gradient
-    for y in range(0, ROAD_Y - 60):
-        ratio = y / (ROAD_Y - 60)
-        r = SKY_TOP[0] + (SKY_BOTTOM[0] - SKY_TOP[0]) * ratio
-        g = SKY_TOP[1] + (SKY_BOTTOM[1] - SKY_TOP[1]) * ratio
-        b = SKY_TOP[2] + (SKY_BOTTOM[2] - SKY_TOP[2]) * ratio
-        pygame.draw.line(screen, (r, g, b), (0, y), (WIDTH, y))
+def dc(col,x,y,rad):
+    pygame.draw.circle(screen, col, (int(x),int(y)), rad)
 
-    # Ground
-    pygame.draw.rect(screen, GROUND, (0, ROAD_Y - 60, WIDTH, 60))
+def dt(fkey, s, col, cx, cy, anchor="c"):
+    surf = F[fkey].render(s, True, col)
+    if   anchor=="c": screen.blit(surf,(int(cx)-surf.get_width()//2, int(cy)-surf.get_height()//2))
+    elif anchor=="l": screen.blit(surf,(int(cx), int(cy)-surf.get_height()//2))
+    elif anchor=="r": screen.blit(surf,(int(cx)-surf.get_width(), int(cy)-surf.get_height()//2))
 
-    # Clouds (slow parallax)
-    cloud_shift = (world_x * 0.05) % (WIDTH + 200)
-    for cx, cy, scale in [(120, 60, 1.0), (420, 40, 1.3), (700, 80, 0.8)]:
-        x = (cx - cloud_shift) % (WIDTH + 200) - 100
-        draw_cloud(x, cy, scale)
+# ── SKY (pre-rendered) ───────────────────────────────────────────
+sky_surf = pygame.Surface((W, ROAD_Y))
+for y in range(ROAD_Y):
+    r2 = y/ROAD_Y
+    c  = tuple(int(SKY_TOP[i]+(SKY_BOT[i]-SKY_TOP[i])*r2) for i in range(3))
+    pygame.draw.line(sky_surf, c, (0,y),(W,y))
 
-    # Distant hills
-    hill_shift = (world_x * 0.15) % (WIDTH + 300)
-    for hx, scale in [(100, 1.0), (450, 1.4), (800, 0.9)]:
-        x = (hx - hill_shift) % (WIDTH + 300) - 150
-        pygame.draw.ellipse(screen, (110, 180, 110), (x, ROAD_Y - 100, 260 * scale, 90 * scale))
+# ── BACKGROUND DRAW ──────────────────────────────────────────────
+def draw_bg():
+    screen.blit(sky_surf,(0,0))
 
-    # Road
-    pygame.draw.rect(screen, ROAD_COL, (0, ROAD_Y, WIDTH, HEIGHT - ROAD_Y))
-    pygame.draw.rect(screen, (40, 40, 45), (0, ROAD_Y, WIDTH, 6))
+    # distant hills (slow parallax)
+    hs = (world_x * 0.08) % (W + 500)
+    for hx, sc, col in [(0,1.2,HILL1),(300,1.5,HILL2),(650,1.0,HILL1),(950,1.3,HILL2)]:
+        x = int((hx - hs) % (W+500)) - 200
+        pygame.draw.ellipse(screen, col,
+            (x, ROAD_Y-130, int(380*sc), int(100*sc)))
 
-    # Dashed road lines (scroll with world)
-    dash_w, gap = 40, 30
-    shift = int(world_x * 4) % (dash_w + gap)
-    x = -shift
-    while x < WIDTH:
-        pygame.draw.rect(screen, LINE_COL, (x, ROAD_Y + 30, dash_w, 6), border_radius=3)
-        x += dash_w + gap
+    # buildings (medium parallax)
+    for b in buildings:
+        scx = int(b["x"] - world_x * 1.0)
+        if -120 < scx < W + 20:
+            by = ROAD_Y - 55 - b["h"]
+            dr(b["col"], scx, by, b["w"], b["h"])
+            dr((max(0,b["col"][0]-30),max(0,b["col"][1]-30),max(0,b["col"][2]-30)),
+               scx, by, b["w"], 6)
+            # windows
+            ww, wh = 9, 10
+            for wr in range(b["win_rows"]):
+                for wc in range(b["win_cols"]):
+                    wx2 = scx + 6 + wc*(ww+5)
+                    wy2 = by + 10 + wr*(wh+6)
+                    if wx2+ww < scx+b["w"]-4:
+                        lit = random.random() > 0.35
+                        wc2 = (255,245,180) if lit else (60,70,90)
+                        dr(wc2, wx2, wy2, ww, wh, 1)
+            # shop sign on ground floor
+            dr(random.choice([SIGN_GREEN,SIGN_BLUE]),
+               scx+4, by+b["h"]-18, b["w"]-8, 14, 2)
 
+    # footpath
+    dr(FOOTPATH, 0, ROAD_Y-14, W, 14)
+    dr((160,145,120), 0, ROAD_Y-14, W, 3)
 
-def draw_cloud(x, y, scale=1.0):
-    s = scale
-    pygame.draw.ellipse(screen, (255, 255, 255), (x, y, 70 * s, 35 * s))
-    pygame.draw.ellipse(screen, (255, 255, 255), (x + 30 * s, y - 12 * s, 55 * s, 35 * s))
-    pygame.draw.ellipse(screen, (255, 255, 255), (x + 55 * s, y, 60 * s, 32 * s))
+    # trees
+    for tr in trees:
+        scx = int(tr["x"] - world_x)
+        if -20 < scx < W+20:
+            dr((100,65,30), scx-3, ROAD_Y-14-tr["h"]//2, 6, tr["h"]//2)
+            dc(tr["col"], scx, ROAD_Y-14-tr["h"]//2-8, tr["h"]//3)
 
+    # road
+    dr(ROAD_C,    0, ROAD_Y,   W, H-ROAD_Y)
+    dr(ROAD_SIDE, 0, ROAD_Y,   W, 8)
+    dr(ROAD_SIDE, 0, H-20,     W, 20)
+    # centre dashes
+    dw, gap = 46, 28
+    sh = int(world_x * 3.8) % (dw+gap)
+    x = -sh
+    while x < W:
+        dr(DASH_C, x, ROAD_Y+38, dw, 7, 3)
+        x += dw+gap
 
-def draw_bus_stops():
-    for sx in STOP_POSITIONS:
-        screen_x = sx - world_x
-        if -60 < screen_x < WIDTH + 60:
-            pygame.draw.rect(screen, (180, 180, 190), (screen_x - 3, ROAD_Y - 90, 6, 90))
-            pygame.draw.rect(screen, ACCENT, (screen_x - 28, ROAD_Y - 110, 56, 24), border_radius=4)
-            lbl = font_small.render("BUS STOP", True, (40, 40, 40))
-            screen.blit(lbl, (screen_x - lbl.get_width() // 2, ROAD_Y - 105))
-            # shelter
-            pygame.draw.line(screen, (150, 150, 160), (screen_x - 45, ROAD_Y - 5),
-                              (screen_x - 45, ROAD_Y - 55), 4)
-            pygame.draw.line(screen, (150, 150, 160), (screen_x - 45, ROAD_Y - 55),
-                              (screen_x + 5, ROAD_Y - 55), 4)
+def draw_clouds():
+    cs = (world_x * 0.035) % (W + 400)
+    for cx,cy,sc in [(60,55,1.1),(320,35,1.4),(650,65,0.9),(900,42,1.2)]:
+        x = int((cx-cs)%(W+400)) - 160
+        for dx,dy,rw,rh in [(0,0,90,38),(32,-16,68,40),(68,0,76,36)]:
+            pygame.draw.ellipse(screen,(252,254,255),(x+dx,cy+dy,int(rw*sc),int(rh*sc)))
 
+# ── BUS STOP SCENERY ─────────────────────────────────────────────
+def draw_stop_scenery():
+    bus_pos = world_x + W//2
+    for i, sx in enumerate(STOPS[:-1]):   # skip last (=Kalanki reset)
+        scx = int(sx - world_x)
+        if -200 < scx < W + 200:
+            name = ROUTE[i]
+            is_next = (i == cur_stop_idx)
 
-def draw_bus(x, y):
-    bob = math.sin(bob_offset) * 1.5 if bus_moving else 0
-    y += bob
+            # shelter back wall
+            sw, sh2 = 110, 65
+            sbase = ROAD_Y - 16
+            dr((210,200,185), scx-sw//2, sbase-sh2, sw, sh2, 4)
+            dr((190,180,165), scx-sw//2, sbase-sh2, sw,  4)    # top
 
-    # Shadow
-    pygame.draw.ellipse(screen, (20, 20, 20), (x + 5, y + BUS_H - 3, BUS_W - 5, 14))
+            # shelter pillars
+            for px in [scx-sw//2+6, scx+sw//2-10]:
+                dr((160,150,140), px, sbase-sh2, 7, sh2)
 
-    # Body
-    body_rect = (x, y, BUS_W, BUS_H)
-    pygame.draw.rect(screen, (220, 60, 60), body_rect, border_radius=10)
-    pygame.draw.rect(screen, (255, 255, 255), (x, y + BUS_H - 16, BUS_W, 6))  # stripe
+            # shelter roof (slight overhang)
+            dr((60,80,50) if not is_next else (30,110,55),
+               scx-sw//2-8, sbase-sh2-6, sw+16, 8, 3)
 
-    # Roof line
-    pygame.draw.rect(screen, (180, 40, 40), (x + 4, y, BUS_W - 8, 8), border_radius=4)
+            # green nameplate
+            np_w = max(130, len(name)*8+16)
+            dr((20,110,55), scx-np_w//2, sbase-sh2-28, np_w, 22, 4)
+            dr((15, 85,40), scx-np_w//2, sbase-sh2-28, np_w,  4,  4)
+            dt("stop", name, WHITE, scx, sbase-sh2-17)
 
-    # Windows
-    for i, wx in enumerate([x + 10, x + 38, x + 66]):
-        pygame.draw.rect(screen, (200, 240, 255), (wx, y + 12, 22, 18), border_radius=3)
-        pygame.draw.rect(screen, (255, 255, 255), (wx, y + 12, 22, 7))
+            # route number badge
+            dr((200,40,40), scx+np_w//2-28, sbase-sh2-28, 28, 22, 4)
+            dt("xxs","R·01",WHITE, scx+np_w//2-14, sbase-sh2-17)
 
-    # Door
-    pygame.draw.rect(screen, (60, 60, 60), (x + BUS_W - 16, y + 12, 12, 30), border_radius=2)
+            # bench inside shelter
+            dr((140,100,70), scx-30, sbase-20, 60, 6, 2)
+            dr((120, 80,50), scx-28, sbase-14, 8, 14, 2)
+            dr((120, 80,50), scx+20, sbase-14, 8, 14, 2)
 
-    # Headlight
-    pygame.draw.circle(screen, (255, 255, 200), (x + BUS_W - 4, y + BUS_H - 22), 4)
+            # highlight ring if this is the next stop
+            if is_next:
+                pygame.draw.rect(screen,(255,220,30),
+                    (scx-np_w//2-2, sbase-sh2-30, np_w+4, 26), 2, border_radius=5)
 
-    # Wheels (rotating spokes)
-    for wx in [x + 22, x + BUS_W - 22]:
-        wy = y + BUS_H - 2
-        pygame.draw.circle(screen, (20, 20, 20), (int(wx), int(wy)), 13)
-        pygame.draw.circle(screen, (180, 180, 180), (int(wx), int(wy)), 6)
-        for a in range(0, 360, 90):
-            ang = math.radians(a) + wheel_angle
-            ex = wx + math.cos(ang) * 6
-            ey = wy + math.sin(ang) * 6
-            pygame.draw.line(screen, (90, 90, 90), (wx, wy), (ex, ey), 2)
+            # passenger figures
+            for p in pax_groups:
+                if p["stop"] == i:
+                    px2 = int(p["x"] - world_x)
+                    if scx-80 < px2 < scx+80:
+                        dc(p["col"],        px2, sbase-9,  5)   # body
+                        dc((235,195,165),   px2, sbase-20, 4)   # head
+                        pygame.draw.line(screen,p["col"],
+                            (px2,sbase-4),(px2-4,sbase+8),2)
+                        pygame.draw.line(screen,p["col"],
+                            (px2,sbase-4),(px2+4,sbase+8),2)
 
-    # Label
-    lbl = font_small.render("CITY BUS", True, (255, 255, 255))
-    screen.blit(lbl, (x + BUS_W // 2 - lbl.get_width() // 2, y + 2))
+            # zebra crossing
+            for zx in range(scx+sw//2+10, scx+sw//2+60, 12):
+                dr(WHITE, zx, ROAD_Y+2, 8, 20)
 
-    # Exhaust puffs when moving
-    if bus_moving:
-        for i in range(3):
-            ex = x - 6 - i * 10 - (wheel_angle * 4) % 10
-            ey = y + BUS_H - 6 - i * 4
-            r = 4 - i
-            if r > 0:
-                pygame.draw.circle(screen, (210, 210, 210), (int(ex), int(ey)), r)
+# ── BUS ───────────────────────────────────────────────────────────
+BW, BH = 140, 66
 
+def draw_bus(bx, by):
+    b  = math.sin(bob)*1.8 if moving else 0
+    by = int(by + b); bx = int(bx)
+
+    # shadow
+    pygame.draw.ellipse(screen,(10,10,12),(bx+8,by+BH+1,BW-12,10))
+
+    # main body
+    dr(BUS_RED,  bx,    by,       BW,   BH,  10)
+    # roof
+    dr(BUS_DARK, bx+4,  by,       BW-8, 12,   6)
+    # gold waist stripe
+    dr(BUS_GOLD, bx,    by+BH-16, BW,    9)
+    # lower skirt
+    dr(BUS_DARK, bx,    by+BH-7,  BW,    7,   4)
+
+    # front face details
+    dr((30,30,35), bx+BW-18, by+8,  14, 32, 3)   # door
+    dr((55,57,62), bx+BW-18, by+24, 14,  2)       # door mid
+
+    # windows (3 pax + 1 driver)
+    for wx in [bx+12, bx+46, bx+80]:
+        dr(WIN_C,        wx,    by+14, 26, 22, 5)
+        dr((210,242,255),wx,    by+14, 26,  9, 5)
+        # window frame
+        pygame.draw.rect(screen,(150,180,200),(wx,by+14,26,22),1,border_radius=5)
+
+    # driver window (smaller)
+    dr(WIN_C,        bx+BW-40, by+10, 20, 18, 4)
+    dr((210,242,255),bx+BW-40, by+10, 20,  7, 4)
+
+    # headlight + indicator
+    dc((255,252,200), bx+BW-1, by+BH-22, 6)
+    pygame.draw.ellipse(screen,(255,230,100),(bx+BW-3,by+BH-30,12,10))
+    dc((255,120,30), bx+BW-1, by+BH-36, 4)   # indicator
+
+    # tail light
+    dc((200,30,30), bx+3, by+BH-22, 5)
+    dc((255,60,60), bx+3, by+BH-22, 3)
+
+    # destination board above windscreen
+    dr((20,22,38), bx+BW-62, by+2, 58, 14, 3)
+    dt("xxs","RING ROAD · RT-01", ACCENT, bx+BW-33, by+9)
+
+    # route board on side
+    dr((20,22,38), bx+8, by+2, 80, 13, 3)
+    dt("xxs","काठमाडौं रिङ रोड", (200,220,255), bx+48, by+8)
+
+    # wheels
+    for wx in [bx+24, bx+BW-24]:
+        wy = by+BH+2
+        dc(TYRE_C,        wx, wy, 15)
+        dc((70,70,76),    wx, wy, 10)
+        dc((110,112,118), wx, wy,  5)
+        for a in range(0,360,60):
+            ang = math.radians(a)+wheel_ang
+            ex=wx+math.cos(ang)*8; ey=wy+math.sin(ang)*8
+            pygame.draw.line(screen,(95,97,104),(wx,wy),(int(ex),int(ey)),2)
+
+    # exhaust puffs
+    if moving:
+        for i in range(4):
+            ex = bx - 8 - i*10 + math.sin(bob+i)*2
+            ey = by+BH-12-i*3
+            r  = max(1,5-i)
+            s2 = pygame.Surface((r*2,r*2), pygame.SRCALPHA)
+            pygame.draw.circle(s2,(195,195,200,170-i*38),(r,r),r)
+            screen.blit(s2,(int(ex)-r,int(ey)-r))
+
+# ── ROUTE MINIMAP ─────────────────────────────────────────────────
+def draw_minimap():
+    mx,my,mw,mh = 10, H-198, W-20, 34
+    dr(PANEL_TOP, mx,my, mw,mh, 12)
+    pygame.draw.rect(screen,(50,55,100),(mx,my,mw,mh),1,border_radius=12)
+
+    n = len(ROUTE)-1   # last stop = Kalanki (same as first, not shown separately)
+    seg_w = (mw-24) / (n-1)
+
+    # progress line
+    prog = min(1.0, world_x / STOPS[-2]) if STOPS[-2]>0 else 0
+    pygame.draw.line(screen,(50,54,90),
+        (mx+12, my+mh//2),(mx+mw-12, my+mh//2), 3)
+    fill_x = mx+12+int((mw-24)*prog)
+    pygame.draw.line(screen,ACCENT,
+        (mx+12,my+mh//2),(fill_x,my+mh//2), 3)
+
+    for i in range(n):
+        dot_x = int(mx+12 + i*seg_w)
+        passed = (i < cur_stop_idx) or (i == cur_stop_idx and at_stop)
+        active = (i == cur_stop_idx)
+        col = ACCENT if active else (GREEN_C if passed else (55,58,90))
+        r   = 7 if active else 5
+        dc(col, dot_x, my+mh//2, r)
+        if active:
+            pygame.draw.circle(screen,ACCENT,(dot_x,my+mh//2),r,2)
+        # stop name (only show a few to avoid crowding)
+        if i % 3 == 0 or active:
+            name_col = ACCENT if active else (130,130,160)
+            name_s   = ROUTE[i] if len(ROUTE[i])<=10 else ROUTE[i][:9]+"."
+            dt("xxs", name_s, name_col, dot_x, my+mh//2 + (12 if i%2==0 else -13))
+
+    dt("xxs","RING ROAD ROUTE",GREY_C, mx+mw//2, my-9)
+
+# ── BOTTOM PANEL ─────────────────────────────────────────────────
+PANEL_Y = H - 158
 
 def draw_panel():
-    pygame.draw.rect(screen, PANEL_BG, (0, HEIGHT - 150, WIDTH, 150))
-    pygame.draw.line(screen, (90, 100, 160), (0, HEIGHT - 150), (WIDTH, HEIGHT - 150), 2)
+    dr(PANEL_BG, 0, PANEL_Y, W, 158)
+    pygame.draw.line(screen,(55,60,115),(0,PANEL_Y),(W,PANEL_Y),2)
 
-    # Fare
-    fare_txt = font_big.render(f"Running Fare:  Rs. {fare:.2f}", True, ACCENT)
-    screen.blit(fare_txt, (20, HEIGHT - 138))
+    # ── current & next stop info ──
+    dr(PANEL_TOP, 10, PANEL_Y+8, 340, 70, 10)
+    cur_name  = ROUTE[cur_stop_idx] if cur_stop_idx < len(ROUTE) else ROUTE[0]
+    next_name = ROUTE[min(cur_stop_idx+1, len(ROUTE)-1)]
+    dt("xxs","CURRENT STOP", GREY_C, 180, PANEL_Y+20)
+    dt("sm", cur_name, ACCENT, 180, PANEL_Y+37)
+    dt("xxs","NEXT STOP", (130,180,255), 180, PANEL_Y+55)
+    dt("xs", next_name, (160,210,255), 180, PANEL_Y+70)
 
-    # Status
-    status = "● BUS MOVING" if bus_moving else "■ BUS STOPPED"
-    col = (90, 230, 110) if bus_moving else (240, 90, 90)
-    screen.blit(font_med.render(status, True, col), (WIDTH - 200, HEIGHT - 138))
+    # ── fare ──
+    dr(PANEL_TOP, 360, PANEL_Y+8, 220, 70, 10)
+    dt("xxs","RUNNING FARE", GREY_C, 470, PANEL_Y+22)
+    dt("fare",f"Rs.{fare:.2f}", ACCENT, 470, PANEL_Y+56)
 
-    # Card balances
-    n_txt = font_med.render(f"Normal Card Balance:   Rs. {CARD_BALANCES['NORMAL']:.2f}", True, (150, 255, 170))
-    s_txt = font_med.render(f"Special Card Balance:  Rs. {CARD_BALANCES['SPECIAL']:.2f}", True, (150, 200, 255))
-    screen.blit(n_txt, (20, HEIGHT - 100))
-    screen.blit(s_txt, (20, HEIGHT - 72))
+    # ── balances ──
+    dr(PANEL_TOP, 590, PANEL_Y+8, 280, 70, 10)
+    dt("xxs","NORMAL CARD",  GREY_C,        660, PANEL_Y+20)
+    dt("med", f"Rs.{BALANCES['NORMAL']:.2f}", (90,225,135), 660, PANEL_Y+48)
+    dt("xxs","SPECIAL CARD", GREY_C,         800, PANEL_Y+20)
+    dt("med", f"Rs.{BALANCES['SPECIAL']:.2f}",(100,175,255), 800, PANEL_Y+48)
 
-    # Recent transactions
-    screen.blit(font_small.render("Recent Transactions:", True, (180, 180, 200)), (420, HEIGHT - 100))
-    for i, tx in enumerate(transactions[-3:][::-1]):
-        line = f"Rs.{tx['fare']:.2f}  -  {tx['label']}  (Bal Rs.{tx['balance']:.2f})"
-        screen.blit(font_small.render(line, True, (210, 210, 210)), (420, HEIGHT - 78 + i * 20))
+    # ── status + total ──
+    dr(PANEL_TOP, 880, PANEL_Y+8, 210, 70, 10)
+    scol = GREEN_C if moving else RED_C
+    stxt = "● MOVING" if moving else "■ STOPPED"
+    dt("med", stxt, scol, 985, PANEL_Y+28)
+    dt("xxs",f"Total: Rs.{total_collected:.2f}", GREY_C, 985, PANEL_Y+55)
 
-    # Controls hint
-    hint = "SPACE: Start/Stop   |   N: Tap NORMAL card   |   S: Tap SPECIAL card   |   R: Recharge cards"
-    screen.blit(font_small.render(hint, True, (160, 160, 180)), (20, HEIGHT - 22))
+    # ── transactions ──
+    dr(PANEL_TOP, 10, PANEL_Y+86, W-20, 58, 8)
+    dt("xxs","RECENT TRANSACTIONS", GREY_C, 110, PANEL_Y+97)
+    for i, tx in enumerate(transactions[-5:][::-1]):
+        col = (90,225,130) if "Normal" in tx["label"] else (100,175,255)
+        s = F["xxs"].render(
+            f"Rs.{tx['fare']:.2f} — {tx['label']}  (Bal Rs.{tx['bal']:.2f})",
+            True, col)
+        screen.blit(s,(230+i*174, PANEL_Y+91))
 
+    hint="SPACE: Start/Stop   N: Normal card   S: Special card   R: Recharge +Rs.100   ESC: Quit"
+    dt("xxs", hint, (85,88,120), W//2, PANEL_Y+150)
 
-def draw_payment_popup():
-    global msg_timer
-    if msg_timer > 0:
-        alpha_box = pygame.Surface((WIDTH - 40, 50), pygame.SRCALPHA)
-        col = (40, 160, 80, 230) if payment_ok else (180, 50, 50, 230)
-        pygame.draw.rect(alpha_box, col, (0, 0, WIDTH - 40, 50), border_radius=10)
-        screen.blit(alpha_box, (20, ROAD_Y - 200))
+# ── PAYMENT BANNER ────────────────────────────────────────────────
+def draw_pmsg():
+    if pmsg_timer <= 0: return
+    col  = (28,135,55) if pmsg_ok else (145,28,28)
+    surf = pygame.Surface((W-20,44), pygame.SRCALPHA)
+    pygame.draw.rect(surf,(*col,225),(0,0,W-20,44),border_radius=10)
+    screen.blit(surf,(10, ROAD_Y-215))
+    icon = "✓ PAID" if pmsg_ok else "✗ FAILED"
+    dt("sm",f"{icon}  |  {pmsg}", WHITE, W//2, ROAD_Y-193)
 
-        txt = font_med.render(payment_msg, True, (255, 255, 255))
-        screen.blit(txt, (20 + (WIDTH - 40 - txt.get_width()) // 2, ROAD_Y - 187))
-        msg_timer -= 1
+# ── RECEIPT OVERLAY ───────────────────────────────────────────────
+def draw_receipt():
+    if not receipt or receipt_timer <= 0: return
+    ow,oh = 400,230
+    ox,oy = W//2-ow//2, H//2-oh//2-50
+    surf=pygame.Surface((ow,oh),pygame.SRCALPHA)
+    pygame.draw.rect(surf,(18,20,42,240),(0,0,ow,oh),border_radius=16)
+    pygame.draw.rect(surf,(75,80,145,200),(0,0,ow,oh),2,border_radius=16)
+    screen.blit(surf,(ox,oy))
+    dr((30,110,55) if receipt["card"]=="NORMAL" else (30,70,160),
+       ox+ow//2-50, oy+8, 100, 26, 13)
+    dt("xxs","NORMAL CARD" if receipt["card"]=="NORMAL" else "SPECIAL CARD",
+       WHITE, ox+ow//2, oy+21)
+    dt("xs",  "PAYMENT RECEIPT",          ACCENT,   ox+ow//2, oy+46)
+    pygame.draw.line(screen,(55,60,110),(ox+16,oy+58),(ox+ow-16,oy+58),1)
+    dt("xxs", receipt["label"],           GREY_C,   ox+ow//2, oy+74)
+    dt("big", f"Rs. {receipt['paid']:.2f}", GREEN_C, ox+ow//2, oy+108)
+    dt("xxs", f"From: {receipt['from']}  →  To: {receipt['to']}",
+       GREY_C, ox+ow//2, oy+142)
+    dt("xxs", f"Balance remaining: Rs. {receipt['bal']:.2f}",
+       (160,200,255), ox+ow//2, oy+164)
+    dt("xxs", f"Time: {receipt['time']}",  GREY_C,  ox+ow//2, oy+184)
+    dt("xxs", "[ press N / S to pay another card ]",(70,74,110),ox+ow//2, oy+210)
 
+# ── AT-STOP BANNER ────────────────────────────────────────────────
+def draw_at_stop_banner():
+    if not at_stop: return
+    surf=pygame.Surface((320,38),pygame.SRCALPHA)
+    pygame.draw.rect(surf,(20,100,48,220),(0,0,320,38),border_radius=10)
+    screen.blit(surf,(W//2-160, ROAD_Y-260))
+    name = ROUTE[cur_stop_idx] if cur_stop_idx < len(ROUTE) else ROUTE[0]
+    dt("sm",f"Arrived at  {name}", WHITE, W//2, ROAD_Y-241)
 
+# ── TITLE BAR ─────────────────────────────────────────────────────
 def draw_title():
-    title = font_title.render("RFID Bus Fare Management System - Live Simulation", True, (255, 255, 255))
-    screen.blit(title, (WIDTH // 2 - title.get_width() // 2, 10))
+    dr((14,16,32),0,0,W,34)
+    dt("title","RFID BUS FARE MANAGEMENT SYSTEM — KATHMANDU RING ROAD",
+       ACCENT, W//2, 17)
+    hw_col=(55,175,75) if SERIAL_PORT else (90,94,120)
+    dc(hw_col, W-18, 17, 6)
+    dt("xxs","HW" if SERIAL_PORT else "SIM",(165,165,185),W-30,17,"r")
 
+# ── SERIAL ────────────────────────────────────────────────────────
+arduino=None
+if SERIAL_PORT:
+    try:
+        import serial,threading
+        arduino=serial.Serial(SERIAL_PORT,9600,timeout=1); time.sleep(2)
+        def _l():
+            while True:
+                try:
+                    if arduino.in_waiting:
+                        l=arduino.readline().decode().strip()
+                        if l in("NORMAL","SPECIAL"): process(l)
+                except: pass
+                time.sleep(0.05)
+        threading.Thread(target=_l,daemon=True).start()
+        print(f"Arduino on {SERIAL_PORT}")
+    except Exception as e:
+        print(f"Arduino error: {e}")
 
-# ───────────────────────── MAIN LOOP ─────────────────────────
+# ── MAIN LOOP ─────────────────────────────────────────────────────
+BUS_X   = W//2 - BW//2
 running = True
-bus_screen_x = WIDTH // 2 - BUS_W // 2   # bus stays centered; world scrolls under it
 
 while running:
-    dt = clock.tick(FPS) / 1000.0
+    dt_t = clock.tick(FPS)/1000.0
 
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            running = False
-        if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_ESCAPE:
-                running = False
-            elif event.key == pygame.K_SPACE:
-                bus_moving = not bus_moving
-            elif event.key == pygame.K_n:
-                process_payment("NORMAL")
-            elif event.key == pygame.K_s:
-                process_payment("SPECIAL")
-            elif event.key == pygame.K_r:
-                CARD_BALANCES["NORMAL"] += 100
-                CARD_BALANCES["SPECIAL"] += 100
+    for e in pygame.event.get():
+        if e.type==pygame.QUIT: running=False
+        if e.type==pygame.KEYDOWN:
+            if   e.key==pygame.K_ESCAPE: running=False
+            elif e.key==pygame.K_SPACE:
+                moving=not moving; play(SND_TAP)
+            elif e.key==pygame.K_n: process("NORMAL")
+            elif e.key==pygame.K_s: process("SPECIAL")
+            elif e.key==pygame.K_r:
+                BALANCES["NORMAL"] =min(500,BALANCES["NORMAL"]+100)
+                BALANCES["SPECIAL"]=min(500,BALANCES["SPECIAL"]+100)
+                play(SND_TAP)
+        if e.type==pygame.USEREVENT+1: play(SND_OK2)
 
-    # ── Update world ──
-    if bus_moving:
-        world_x += 60 * dt           # scroll speed
-        wheel_angle += 6 * dt
-        bob_offset += 4 * dt
+    # ── update ──
+    bus_pos = world_x + W//2
 
+    # detect stop arrival
+    new_idx = get_stop_idx(world_x)
+    if new_idx != cur_stop_idx:
+        cur_stop_idx = new_idx
+        at_stop      = True
+        stop_dwell   = 90   # 1.5 sec dwell
+        moving       = False
+        play(SND_ARRIVE)
+
+    if at_stop:
+        stop_dwell -= 1
+        if stop_dwell <= 0:
+            at_stop = False
+
+    # reset world at end of route
+    if world_x >= STOPS[-1]:
+        world_x      = 0.0
+        cur_stop_idx = 0
+        fare         = 0.0
+
+    if moving:
+        world_x   += 68*dt_t
+        wheel_ang += 5*dt_t
+        bob       += 5*dt_t
         now = time.time()
-        if now - last_tick >= 1.0:
-            fare = round(fare + FARE_RATE, 2)
-            last_tick = now
+        if now-last_tick>=1.0:
+            fare=round(fare+FARE_RATE,2); last_tick=now
     else:
-        last_tick = time.time()
+        last_tick=time.time()
 
-    # ── Draw ──
-    draw_background()
-    draw_bus_stops()
-    draw_bus(bus_screen_x, ROAD_Y - BUS_H)
+    if pmsg_timer    >0: pmsg_timer-=1
+    if receipt_timer >0: receipt_timer-=1
+
+    # ── draw ──
+    draw_bg()
+    draw_clouds()
+    draw_stop_scenery()
+    draw_bus(BUS_X, ROAD_Y-BH)
     draw_title()
+    draw_minimap()
     draw_panel()
-    draw_payment_popup()
+    draw_pmsg()
+    draw_at_stop_banner()
+    draw_receipt()
 
     pygame.display.flip()
 
 pygame.quit()
+if arduino: arduino.close()

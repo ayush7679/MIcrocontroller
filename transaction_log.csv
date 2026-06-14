@@ -1,2 +1,4 @@
 timestamp,card_type,fare_paid,remaining_balance
 2026-06-14 20:55:05,SPECIAL,19.25,180.75
+2026-06-14 23:32:49,NORMAL,7.50,192.50
+2026-06-14 23:57:37,SPECIAL,37.12,162.88

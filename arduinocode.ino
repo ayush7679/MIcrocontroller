@@ -27,7 +27,7 @@
 MFRC522 rfid(SS_PIN, RST_PIN);
 LiquidCrystal_I2C lcd(0x27, 16, 2);  // try 0x3F if LCD stays blank
 
-// ── YOUR CARD UIDs ──────────────────────────────────────
+//  CARD UIDs -----
 byte normalUID[]  = {0x63, 0xCE, 0xFA, 0x03};  // White card  → Normal (100%)
 byte specialUID[] = {0x33, 0x83, 0xF0, 0x2C};  // Key tag     → Special (55%)
 

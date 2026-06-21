@@ -1,24 +1,37 @@
 """
 RFID Bus Fare Management System — Kathmandu Ring Road Simulator
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Single RC522 reader, DOUBLE-TAP fare system:
+  1st tap of a card  →  TAP IN  (records the boarding station)
+  2nd tap (same card) →  TAP OUT (calculates fare for stations
+                          traveled, deducts balance, clears boarding)
+
+Fare = BASE_FARE + (stations traveled × PER_STOP)
+  Tapping OUT at the very next stop = minimum fare (BASE_FARE + 1×PER_STOP)
+  Special card gets 55% of that fare.
+
 Controls:
   SPACE  →  Start / Stop bus
-  N      →  Tap Normal card  (100% fare)
-  S      →  Tap Special card (55% fare — Student/Senior)
+  N      →  Tap Normal card   (toggles IN/OUT automatically)
+  S      →  Tap Special card  (toggles IN/OUT automatically)
   R      →  Recharge both cards (+Rs.100)
   ESC    →  Quit
+
+Note: the bus automatically waits 3 seconds at every stop before
+it can be started again — like a real bus letting passengers board.
 """
 
 import pygame, time, math, csv, os, datetime, random
 
 # ── CONFIG ────────────────────────────────────────────────────────
-W, H        = 1100, 640
-FPS         = 60
-BASE_FARE   = 25.0       # Rs — minimum/starting fare
-FARE_RATE   = 0.5        # Rs added per second while moving
-ROAD_Y      = 340
-LOG_FILE    = "transaction_log.csv"
-SERIAL_PORT = "COM5"     # port selection
+W, H          = 1100, 640
+FPS           = 60
+BASE_FARE     = 25.0       # Rs — base fare component
+PER_STOP      = 5.0        # Rs added per station traveled (tap-in stop -> tap-out stop)
+ROAD_Y        = 340
+LOG_FILE      = "transaction_log.csv"
+SERIAL_PORT   = "COM5"     # ← change to your port e.g. COM3, /dev/ttyUSB0
+STOP_WAIT_SEC = 3.0        # ← bus dwell time at each stop (seconds)
 
 ROUTE = [
     "Kalanki","Soalte Dobato","Swayambhu","Banasthali Chowk",
@@ -32,6 +45,14 @@ ROUTE = [
 STOP_SPACING = 420
 STOPS        = [i * STOP_SPACING for i in range(len(ROUTE))]
 BALANCES     = {"NORMAL": 200.0, "SPECIAL": 200.0}
+
+# Cardholder names — used in receipts, HUD, and the CSV log.
+CARD_NAMES = {"NORMAL": "Balen Shah", "SPECIAL": "Mahabir Pun"}
+
+# ── TAP-IN TRACKING ────────────────────────────────────────────────
+# None  = card is not currently "on the bus"
+# int   = stop index where the card tapped IN (boarding station)
+ON_BOARD = {"NORMAL": None, "SPECIAL": None}
 
 # ── COLOURS ───────────────────────────────────────────────────────
 SKY_TOP       = ( 30,  95, 170)
@@ -60,6 +81,7 @@ WIN_C      = (185, 232, 255)
 TYRE_C     = ( 22,  22,  28)
 SIGN_GREEN = ( 20, 120,  60)
 SIGN_BLUE  = ( 30,  80, 160)
+IN_C       = ( 90, 200, 255)   # tap-in highlight colour
 
 # ── PYGAME INIT ───────────────────────────────────────────────────
 pygame.init()
@@ -83,7 +105,7 @@ F = {
 }
 
 # ── SOUND ─────────────────────────────────────────────────────────
-SND_OK1 = SND_OK2 = SND_FAIL = SND_TAP = SND_ARRIVE = None
+SND_OK1 = SND_OK2 = SND_FAIL = SND_TAP = SND_ARRIVE = SND_IN = None
 HAS_SND = False
 try:
     import numpy as np
@@ -100,6 +122,7 @@ try:
     SND_FAIL   = synth(300,  380)
     SND_TAP    = synth(660,   70)
     SND_ARRIVE = synth(523,  200)
+    SND_IN     = synth(740,  100)   # distinct chirp for tap-IN
     HAS_SND    = True
     print("Sound: enabled")
 except Exception as e:
@@ -110,10 +133,35 @@ def play(snd):
         try: snd.play()
         except: pass
 
+# ── VOICE ANNOUNCEMENTS (pyttsx3) ──────────────────────────────────
+HAS_VOICE  = False
+tts_engine = None
+try:
+    import pyttsx3, threading
+    tts_engine = pyttsx3.init()
+    tts_engine.setProperty('rate', 165)
+    tts_engine.setProperty('volume', 1.0)
+    HAS_VOICE = True
+    print("Voice: enabled (pyttsx3)")
+except Exception as e:
+    print(f"Voice: disabled ({e})  — pip install pyttsx3")
+
+def speak(text):
+    """Speak text on a background thread so the game never freezes."""
+    print(f"[VOICE] {text}")
+    if not HAS_VOICE:
+        return
+    def _say():
+        try:
+            tts_engine.say(text)
+            tts_engine.runAndWait()
+        except Exception as e:
+            print(f"TTS error: {e}")
+    threading.Thread(target=_say, daemon=True).start()
+
 # ── STATE ─────────────────────────────────────────────────────────
 world_x         = 0.0
 moving          = False
-fare            = BASE_FARE   # starts at Rs.25, ticks up Rs.0.5/sec while moving
 last_tick       = time.time()
 wheel_ang       = 0.0
 bob             = 0.0
@@ -126,7 +174,7 @@ receipt_timer   = 0
 total_collected = 0.0
 cur_stop_idx    = 0
 at_stop         = False
-stop_dwell      = 0
+stop_wait_timer = 0.0     # seconds remaining in the mandatory stop wait
 
 # ── WORLD GENERATION ──────────────────────────────────────────────
 random.seed(7)
@@ -159,13 +207,18 @@ for i, sx in enumerate(STOPS[:-1]):
                             "col": random.choice([(80,110,200),(200,90,70),(90,160,90),(180,140,60)])})
 
 # ── HELPERS ───────────────────────────────────────────────────────
-def log_tx(card, paid, bal):
+def log_tx(event, card, fare_amt, bal, from_stop, to_stop):
+    """Logs every IN and OUT event for a full station-to-station audit trail."""
     new = not os.path.isfile(LOG_FILE)
     with open(LOG_FILE, "a", newline="") as f:
         w = csv.writer(f)
-        if new: w.writerow(["timestamp","card","fare","balance"])
-        w.writerow([datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    card, f"{paid:.2f}", f"{bal:.2f}"])
+        if new:
+            w.writerow(["timestamp","event","card","name","fare","balance","from_stop","to_stop"])
+        w.writerow([
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            event, card, CARD_NAMES[card],
+            f"{fare_amt:.2f}", f"{bal:.2f}", from_stop, to_stop
+        ])
 
 def send_lcd(msg):
     if arduino:
@@ -180,55 +233,96 @@ def get_stop_idx(wx):
         if bus_pos >= STOPS[i]: return i
     return 0
 
-def process(card):
-    global fare, pmsg, pmsg_ok, pmsg_timer, receipt, receipt_timer, total_collected
+def calc_fare(from_idx, to_idx):
+    """Distance-based fare: BASE_FARE + (stops traveled × PER_STOP)."""
+    stops_traveled = max(1, to_idx - from_idx)   # minimum 1 stop charged
+    return round(BASE_FARE + stops_traveled * PER_STOP, 2)
 
-    disc  = 0.55 if card == "SPECIAL" else 1.0
-    paid  = round(fare * disc, 2)
-    label = "Student/Senior" if card == "SPECIAL" else "Normal"
+def tap_card(card):
+    """
+    Single entry point for both keyboard (N/S) and Arduino taps.
+    Automatically decides IN vs OUT based on ON_BOARD state.
+    """
+    global pmsg, pmsg_ok, pmsg_timer, receipt, receipt_timer, total_collected
 
-    if not moving and cur_stop_idx == 0 and fare <= BASE_FARE:
-        pmsg       = "No fare yet — press SPACE to start the bus!"
-        pmsg_ok    = False
+    name = CARD_NAMES[card]
+    print(f"[tap_card] called for {card} ({name}) | ON_BOARD={ON_BOARD[card]} | at_stop={at_stop} | cur_stop_idx={cur_stop_idx}")
+
+    # ── TAP IN ──────────────────────────────────────────────────
+    if ON_BOARD[card] is None:
+        if not at_stop:
+            pmsg       = f"{name}: Tap IN only allowed while bus is stopped!"
+            pmsg_ok    = False
+            pmsg_timer = 180
+            play(SND_FAIL)
+            send_lcd("FAIL")
+            return
+
+        ON_BOARD[card] = cur_stop_idx
+        log_tx("IN", card, 0.0, BALANCES[card], ROUTE[cur_stop_idx], "")
+        pmsg       = f"{name} TAPPED IN at {ROUTE[cur_stop_idx]}"
+        pmsg_ok    = True
         pmsg_timer = 180
-        send_lcd("NOFFARE")
+        play(SND_IN)
+        speak(f"{name} has boarded")
+        send_lcd(f"L1:{name[:16].ljust(16)}")
+        time.sleep(0.03)
+        send_lcd("L2:TAP IN OK        ")
         return
 
+    # ── TAP OUT ─────────────────────────────────────────────────
+    boarded_at = ON_BOARD[card]
+    disc  = 0.55 if card == "SPECIAL" else 1.0
+    base_paid = calc_fare(boarded_at, cur_stop_idx)
+    paid  = round(base_paid * disc, 2)
+
     if BALANCES[card] < paid:
-        pmsg       = f"LOW BALANCE — {label}  |  Only Rs.{BALANCES[card]:.2f} left"
+        pmsg       = f"LOW BALANCE — {name} | Only Rs.{BALANCES[card]:.2f} left, needs Rs.{paid:.2f}"
         pmsg_ok    = False
         pmsg_timer = 220
         play(SND_FAIL)
         send_lcd("FAIL")
         return
 
-    # ── success ──────────────────────────────────────────────────
     BALANCES[card]  = round(BALANCES[card] - paid, 2)
     total_collected = round(total_collected + paid, 2)
-    transactions.append({"label": label, "fare": paid, "bal": BALANCES[card]})
-    log_tx(card, paid, BALANCES[card])
+    transactions.append({
+        "label": name, "fare": paid, "bal": BALANCES[card],
+        "from": ROUTE[boarded_at], "to": ROUTE[cur_stop_idx],
+    })
+    log_tx("OUT", card, paid, BALANCES[card], ROUTE[boarded_at], ROUTE[cur_stop_idx])
 
-    pmsg       = f"Paid Rs.{paid:.2f}  —  {label}  |  Balance: Rs.{BALANCES[card]:.2f}"
+    pmsg       = f"{name} OUT: Rs.{paid:.2f}  ({ROUTE[boarded_at]} → {ROUTE[cur_stop_idx]})"
     pmsg_ok    = True
     pmsg_timer = 220
 
     receipt = {
         "card" : card,
-        "label": label,
+        "name" : name,
         "paid" : paid,
         "bal"  : BALANCES[card],
         "time" : datetime.datetime.now().strftime("%H:%M:%S"),
-        "from" : ROUTE[max(0, cur_stop_idx-1)],
-        "to"   : ROUTE[min(len(ROUTE)-1, cur_stop_idx)],
+        "from" : ROUTE[boarded_at],
+        "to"   : ROUTE[cur_stop_idx],
+        "stops": max(1, cur_stop_idx - boarded_at),
     }
     receipt_timer = 300
-    fare          = BASE_FARE   # reset to base after payment
+    ON_BOARD[card] = None   # trip complete — card is no longer "on board"
 
     play(SND_OK1)
+    speak("Payment successful")
     pygame.time.set_timer(pygame.USEREVENT+1, 180, 1)
 
     fare_str = f"Rs.{paid:.2f} Bal:{BALANCES[card]:.0f}"[:13].ljust(13)
     send_lcd(f"OK:{fare_str}")
+
+def recharge():
+    BALANCES["NORMAL"]  = min(500, BALANCES["NORMAL"]  + 100)
+    BALANCES["SPECIAL"] = min(500, BALANCES["SPECIAL"] + 100)
+    play(SND_TAP)
+    send_lcd("L1:Cards Recharged  ")
+    time.sleep(0.05)
+    send_lcd(f"L2:N:{BALANCES['NORMAL']:.0f} S:{BALANCES['SPECIAL']:.0f}   ")
 
 # ── DRAW UTILS ────────────────────────────────────────────────────
 def dr(col, x, y, w, h, r=0):
@@ -377,6 +471,13 @@ def draw_minimap():
     pygame.draw.line(screen,(50,54,90),(mx+12,my+mh//2),(mx+mw-12,my+mh//2),3)
     fill_x=mx+12+int((mw-24)*prog)
     pygame.draw.line(screen,ACCENT,(mx+12,my+mh//2),(fill_x,my+mh//2),3)
+
+    # show boarding-station markers for any card currently on board
+    for card, boarded_idx in ON_BOARD.items():
+        if boarded_idx is not None:
+            bdx = mx+12+boarded_idx*seg_w
+            dc(IN_C, bdx, my+mh//2-12, 4)
+
     for i in range(n):
         dot_x=int(mx+12+i*seg_w)
         passed=(i<cur_stop_idx) or (i==cur_stop_idx and at_stop)
@@ -405,10 +506,19 @@ def draw_panel():
     dt("xxs","NEXT STOP",  (130,180,255),  180,PANEL_Y+55)
     dt("xs",  next_name,   (160,210,255),  180,PANEL_Y+70)
 
-    # ── RUNNING FARE — live, ticking every second ─────────────────
+    # ── ON-BOARD STATUS — shows who's currently riding & from where ──
     dr(PANEL_TOP,360,PANEL_Y+8,220,70,10)
-    dt("xxs","RUNNING FARE",GREY_C,470,PANEL_Y+22)
-    dt("fare",f"Rs.{fare:.2f}",ACCENT,470,PANEL_Y+56)
+    dt("xxs","ON BOARD",GREY_C,470,PANEL_Y+20)
+    y_line = PANEL_Y+38
+    any_onboard = False
+    for card in ("NORMAL","SPECIAL"):
+        if ON_BOARD[card] is not None:
+            any_onboard = True
+            col = GREEN_C if card=="NORMAL" else (100,175,255)
+            dt("xxs", f"{CARD_NAMES[card]} — since {ROUTE[ON_BOARD[card]]}", col, 470, y_line, "c")
+            y_line += 15
+    if not any_onboard:
+        dt("xxs","No cards on board", (110,114,140), 470, y_line, "c")
 
     dr(PANEL_TOP,590,PANEL_Y+8,280,70,10)
     dt("xxs","NORMAL CARD",  GREY_C,          660,PANEL_Y+20)
@@ -418,23 +528,27 @@ def draw_panel():
 
     dr(PANEL_TOP,880,PANEL_Y+8,210,70,10)
     scol=GREEN_C if moving else RED_C
-    stxt="● MOVING" if moving else "■ STOPPED"
+    if at_stop and stop_wait_timer > 0:
+        stxt = f"■ WAIT {stop_wait_timer:.1f}s"
+        scol = ACCENT
+    else:
+        stxt = "● MOVING" if moving else "■ STOPPED"
     dt("med",stxt,scol,985,PANEL_Y+28)
     dt("xxs",f"Total: Rs.{total_collected:.2f}",GREY_C,985,PANEL_Y+55)
 
     dr(PANEL_TOP,10,PANEL_Y+86,W-20,58,8)
-    dt("xxs","RECENT TRANSACTIONS",GREY_C,110,PANEL_Y+97)
-    for i,tx in enumerate(transactions[-5:][::-1]):
-        col=(90,225,130) if "Normal" in tx["label"] else (100,175,255)
+    dt("xxs","RECENT TRIPS (tap-out events)",GREY_C,140,PANEL_Y+97)
+    for i,tx in enumerate(transactions[-4:][::-1]):
+        col=(90,225,130) if tx["label"]==CARD_NAMES["NORMAL"] else (100,175,255)
         s=F["xxs"].render(
-            f"Rs.{tx['fare']:.2f} — {tx['label']}  (Bal Rs.{tx['bal']:.2f})",
+            f"Rs.{tx['fare']:.2f} {tx['label']} {tx['from'][:8]}→{tx['to'][:8]}",
             True,col)
-        screen.blit(s,(230+i*174,PANEL_Y+91))
+        screen.blit(s,(20+i*270,PANEL_Y+91))
 
     hw_status=f"Arduino: {SERIAL_PORT}" if arduino else "Arduino: simulation only"
     hw_col=(55,175,75) if arduino else (200,80,80)
     dt("xxs",hw_status,hw_col,W-140,PANEL_Y+150)
-    hint="SPACE: Start/Stop   N: Normal card   S: Special card   R: Recharge +Rs.100   ESC: Quit"
+    hint="SPACE: Start/Stop   N/S: Tap card (auto IN/OUT)   R: Recharge   ESC: Quit"
     dt("xxs",hint,(85,88,120),W//2-60,PANEL_Y+150)
 
 def draw_pmsg():
@@ -443,30 +557,29 @@ def draw_pmsg():
     surf=pygame.Surface((W-20,44),pygame.SRCALPHA)
     pygame.draw.rect(surf,(*col,225),(0,0,W-20,44),border_radius=10)
     screen.blit(surf,(10,ROAD_Y-215))
-    icon="✓ PAID" if pmsg_ok else "✗ FAILED"
-    dt("sm",f"{icon}  |  {pmsg}",WHITE,W//2,ROAD_Y-193)
+    icon="✓" if pmsg_ok else "✗"
+    dt("sm",f"{icon}  {pmsg}",WHITE,W//2,ROAD_Y-193)
 
 def draw_receipt():
     if not receipt or receipt_timer<=0: return
-    ow,oh=400,230; ox,oy=W//2-ow//2,H//2-oh//2-50
+    ow,oh=420,250; ox,oy=W//2-ow//2,H//2-oh//2-50
     surf=pygame.Surface((ow,oh),pygame.SRCALPHA)
     pygame.draw.rect(surf,(18,20,42,240),(0,0,ow,oh),border_radius=16)
     pygame.draw.rect(surf,(75,80,145,200),(0,0,ow,oh),2,border_radius=16)
     screen.blit(surf,(ox,oy))
     dr((30,110,55) if receipt["card"]=="NORMAL" else (30,70,160),
-       ox+ow//2-50,oy+8,100,26,13)
-    dt("xxs","NORMAL CARD" if receipt["card"]=="NORMAL" else "SPECIAL CARD",
-       WHITE,ox+ow//2,oy+21)
-    dt("xs", "PAYMENT RECEIPT",  ACCENT,       ox+ow//2,oy+46)
+       ox+ow//2-70,oy+8,140,26,13)
+    dt("xxs", receipt["name"], WHITE,ox+ow//2,oy+21)
+    dt("xs", "TAP-OUT RECEIPT",  ACCENT,       ox+ow//2,oy+46)
     pygame.draw.line(screen,(55,60,110),(ox+16,oy+58),(ox+ow-16,oy+58),1)
-    dt("xxs",receipt["label"],   GREY_C,       ox+ow//2,oy+74)
-    dt("big",f"Rs. {receipt['paid']:.2f}",GREEN_C,ox+ow//2,oy+108)
+    dt("xxs",f"{receipt['stops']} station(s) traveled", GREY_C, ox+ow//2,oy+74)
+    dt("big",f"Rs. {receipt['paid']:.2f}",GREEN_C,ox+ow//2,oy+110)
     dt("xxs",f"From: {receipt['from']}  →  To: {receipt['to']}",
-       GREY_C,ox+ow//2,oy+142)
+       GREY_C,ox+ow//2,oy+146)
     dt("xxs",f"Balance remaining: Rs. {receipt['bal']:.2f}",
-       (160,200,255),ox+ow//2,oy+164)
-    dt("xxs",f"Time: {receipt['time']}",GREY_C,ox+ow//2,oy+184)
-    dt("xxs","[ press N / S to pay another card ]",(70,74,110),ox+ow//2,oy+210)
+       (160,200,255),ox+ow//2,oy+168)
+    dt("xxs",f"Time: {receipt['time']}",GREY_C,ox+ow//2,oy+188)
+    dt("xxs","[ tap again next ride to start a new trip ]",(70,74,110),ox+ow//2,oy+212)
 
 def draw_at_stop_banner():
     if not at_stop: return
@@ -474,7 +587,10 @@ def draw_at_stop_banner():
     pygame.draw.rect(surf,(20,100,48,220),(0,0,320,38),border_radius=10)
     screen.blit(surf,(W//2-160,ROAD_Y-260))
     name=ROUTE[cur_stop_idx] if cur_stop_idx<len(ROUTE) else ROUTE[0]
-    dt("sm",f"Arrived at  {name}",WHITE,W//2,ROAD_Y-241)
+    if stop_wait_timer > 0:
+        dt("sm",f"Arrived at  {name}  —  waiting {stop_wait_timer:.1f}s",WHITE,W//2,ROAD_Y-241)
+    else:
+        dt("sm",f"Arrived at  {name}  —  ready to depart",WHITE,W//2,ROAD_Y-241)
 
 def draw_title():
     dr((14,16,32),0,0,W,34)
@@ -492,17 +608,29 @@ if SERIAL_PORT:
         time.sleep(2)
 
         def _listen():
+            print("[Serial] listener thread started, waiting for Arduino data...")
             while True:
                 try:
                     if arduino.in_waiting:
-                        line = arduino.readline().decode(errors="ignore").strip()
-                        print(f"[Arduino] {line}")
-                        if   line == "NORMAL":  process("NORMAL")
-                        elif line == "SPECIAL": process("SPECIAL")
-                        elif line.startswith("UNKNOWN"):
+                        raw = arduino.readline()
+                        line = raw.decode(errors="ignore").strip()
+                        if not line:
+                            continue
+                        print(f"[Arduino RAW] {raw!r}  ->  parsed: '{line}'")
+                        # Accepts "NORMAL", "NORMAL:Balen Shah", etc.
+                        token = line.split(":")[0].strip().upper()
+                        if token == "NORMAL":
+                            print("[Serial] -> routing to tap_card('NORMAL')")
+                            tap_card("NORMAL")
+                        elif token == "SPECIAL":
+                            print("[Serial] -> routing to tap_card('SPECIAL')")
+                            tap_card("SPECIAL")
+                        elif token == "UNKNOWN":
                             print(f"  Unregistered UID: {line}")
-                        elif line == "READY":
+                        elif token == "READY":
                             print("  Arduino ready")
+                        else:
+                            print(f"  [Serial] Unrecognized line, ignored: '{line}'")
                 except Exception as e:
                     print(f"Serial read error: {e}")
                 time.sleep(0.05)
@@ -525,58 +653,53 @@ while running:
         if e.type == pygame.KEYDOWN:
             if   e.key == pygame.K_ESCAPE: running = False
             elif e.key == pygame.K_SPACE:
-                moving = not moving
-                play(SND_TAP)
-                if moving:
-                    send_lcd("L1:Bus Running...  ")
-                    time.sleep(0.05)
-                    send_lcd("L2:Tap card 2 Pay  ")
+                # Block manual start while the mandatory 3-second
+                # stop wait is still counting down.
+                if at_stop and stop_wait_timer > 0:
+                    pmsg       = f"Please wait {stop_wait_timer:.1f}s before departing"
+                    pmsg_ok    = False
+                    pmsg_timer = 90
                 else:
-                    send_lcd("L1:Bus Stopped     ")
-                    time.sleep(0.05)
-                    send_lcd("L2:                ")
-            elif e.key == pygame.K_n: process("NORMAL")
-            elif e.key == pygame.K_s: process("SPECIAL")
-            elif e.key == pygame.K_r:
-                BALANCES["NORMAL"]  = min(500, BALANCES["NORMAL"]  + 100)
-                BALANCES["SPECIAL"] = min(500, BALANCES["SPECIAL"] + 100)
-                play(SND_TAP)
-                send_lcd("L1:Cards Recharged  ")
-                time.sleep(0.05)
-                send_lcd(f"L2:N:{BALANCES['NORMAL']:.0f} S:{BALANCES['SPECIAL']:.0f}   ")
+                    moving = not moving
+                    play(SND_TAP)
+                    if moving:
+                        at_stop = False
+                        send_lcd("L1:Bus Running...  ")
+                        time.sleep(0.05)
+                        send_lcd("L2:Tap card 2 Pay  ")
+                    else:
+                        send_lcd("L1:Bus Stopped     ")
+                        time.sleep(0.05)
+                        send_lcd("L2:                ")
+            elif e.key == pygame.K_n: tap_card("NORMAL")
+            elif e.key == pygame.K_s: tap_card("SPECIAL")
+            elif e.key == pygame.K_r: recharge()
         if e.type == pygame.USEREVENT+1: play(SND_OK2)
 
     # ── update world ──────────────────────────────────────────────
     new_idx = get_stop_idx(world_x)
     if new_idx != cur_stop_idx:
-        cur_stop_idx = new_idx
-        at_stop      = True
-        stop_dwell   = 90
-        moving       = False
+        cur_stop_idx    = new_idx
+        at_stop         = True
+        stop_wait_timer = STOP_WAIT_SEC
+        moving          = False
         play(SND_ARRIVE)
         stop_name = ROUTE[cur_stop_idx][:16].ljust(16)
         send_lcd(f"L1:{stop_name}")
         time.sleep(0.05)
         send_lcd("L2:Tap card 2 Pay  ")
 
-    if at_stop:
-        stop_dwell -= 1
-        if stop_dwell <= 0:
-            at_stop = False
+    if at_stop and stop_wait_timer > 0:
+        stop_wait_timer = max(0.0, stop_wait_timer - dt_t)
 
     if world_x >= STOPS[-1]:
         world_x      = 0.0
         cur_stop_idx = 0
-        fare         = BASE_FARE   # reset to Rs.25, not zero
 
     if moving:
         world_x   += 68 * dt_t
         wheel_ang += 5  * dt_t
         bob       += 5  * dt_t
-        now = time.time()
-        if now - last_tick >= 1.0:
-            fare      = round(fare + FARE_RATE, 2)   # +Rs.0.50 every second
-            last_tick = now
     else:
         last_tick = time.time()
 
